@@ -18,6 +18,7 @@ var API = {
 var PICTURES_IN_PARALLEL = 10;
 var TLLIMIT = 'max';
 var AILIMIT = 'max';
+var GRCLIMIT = 'max';
 
 var credentials = {
   name: null,
@@ -120,7 +121,7 @@ function askCredentials(credentials, callback) {
 function login(cookie, name, pass, callback) {
   function onRes(err, res) {
     if(err)
-      callback(err);
+      return callback(err);
     if(res.data.login.result === 'NeedToken') {
       cookie[res.data.login.cookieprefix + '_session'] = res.data.login.sessionid;
       api.exec('login', {
@@ -151,7 +152,7 @@ function readMetaNamespaces(namespaces, callback) {
     siprop: 'namespaces'
   }, function(err, res) {
     if(err)
-      callback(err);
+      return callback(err);
     for(var e in res.data.query.namespaces)
       namespaces[e] = res.data.query.namespaces[e]['*'] || null;
     callback(null, namespaces);
@@ -161,7 +162,7 @@ function readMetaNamespaces(namespaces, callback) {
 function readConfig(config, page, callback) {
   function onRes(err, res) {
     if(err)
-      callback(err);
+      return callback(err);
 
     config.pageid = +res.data.query.pageids[0];
     config.title = res.data.query.pages[config.pageid].title;
@@ -169,7 +170,7 @@ function readConfig(config, page, callback) {
     config.oldid = rev.revid;
     xml2js.parseString(rev['*'], function(err, data) {
       if(err)
-        callback(err);
+        return callback(err);
 
       var el = data.settings.text;
       for(var i = 0; i < el.length; ++i)
@@ -210,12 +211,12 @@ function readConfig(config, page, callback) {
   }, onRes);
 }
 
-function proceed(callback) {
-  function queryImages(aifrom) {
+function traverseAllImages(callback) {
+  function queryAllImages(aifrom) {
     var options = {
       list:    'allimages',
       ailimit: AILIMIT,
-      aiprop:  'timestamp|size|sha1'
+      aiprop:  ''
     };
     if(aifrom !== null)
       options.aifrom = aifrom;
@@ -224,25 +225,71 @@ function proceed(callback) {
 
   function processImages(err, res) {
     if(err)
-      callback(err);
+      return callback(err);
     Seq(res.data.query.allimages)
       .parEach(PICTURES_IN_PARALLEL, function(image) {
-        processImage(image, this);
+        processImage(image.title, this);
       })
       .seq(function() {
         try {
           if(res.data['query-continue'].allimages.aifrom)
-            return queryImages(res.data['query-continue'].allimages.aifrom);
+            return queryAllImages(res.data['query-continue'].allimages.aifrom);
         } catch(e) { }
         callback(null);
       });
   }
 
-  queryImages(null);
+  queryAllImages(null);
 }
 
-function processImage(image, callback) {
-  if(config.ruleset.ignore[image.title] === true)
+function traverseRC(grcstart, callback) {
+  function queryRC(grcstart) {
+    var options = {
+      generator:      'recentchanges',
+      redirects:      true,
+      indexpageids:   true,
+      grcdir:         'newer',
+      grcnamespace:   6,
+      grcexcludeuser: credentials.name,
+      grcshow:        '!redirect',
+      grclimit:       GRCLIMIT,
+      grctype:        'edit|new',
+      grctoponly:     true
+    };
+    if(grcstart)
+      options.grcstart = grcstart;
+    api.exec('query', options, processRC);
+  }
+
+  function processRC(err, res) {
+    if(err)
+      return callback(err);
+    Seq(res.data.query.pageids)
+      .parEach(PICTURES_IN_PARALLEL, function(pageid) {
+        processImage(res.data.query.pages[pageid].title, this);
+      })
+      .seq(function() {
+        try {
+          if(res.data['query-continue'].recentchanges.grcstart) {
+            return queryRC(res.data['query-continue'].recentchanges.grcstart);
+          }
+        } catch(e) { }
+        callback(null);
+      });
+  }
+
+  queryRC(grcstart);
+}
+
+function stripNS(name, ns) {
+  if(!namespaces[ns])
+    return name;
+  else
+    return name.substring(namespaces[ns].length + 1);
+}
+
+function processImage(title, callback) {
+  if(config.ruleset.ignore[stripNS(title, 6)] === true)
     return callback(null);
 
   function queryTemplates(tlcontinue) {
@@ -255,7 +302,7 @@ function processImage(image, callback) {
       inprop:      'protection',
       intoken:     'edit',
       indexpageids: true,
-      titles:       image.title
+      titles:       title
     };
     if(tlcontinue !== null)
       options.tlcontinue = tlcontinue;
@@ -264,13 +311,15 @@ function processImage(image, callback) {
 
   function processTemplates(err, res) {
     if(err)
-      callback(err);
+      return callback(err);
 
     var imgInfo = res.data.query.pages[ res.data.query.pageids[0] ];
     var template;
-    while( (template = imgInfo.templates.shift()) ) {
-      if(config.ruleset.allow[template.title.substring(namespaces[10].length + 1)] === true)
-        return callback(null);
+    if(imgInfo.templates) {
+      while( (template = imgInfo.templates.shift()) ) {
+        if(config.ruleset.allow[stripNS(template.title, 10)] === true)
+          return callback(null);
+      }
     }
 
     try {
@@ -286,32 +335,42 @@ function processImage(image, callback) {
 
 function editImage(imgInfo, type, callback) {
   var options = {
-    summary:        config.texts[type + ' summary'],
-    prependtext:    config.texts[type + ' prepend'],
-    appendtext:     config.texts[type + ' append'],
+    title:          imgInfo.title,
+    basetimestamp:  imgInfo.revisions[0].timestamp,
+    starttimestamp: imgInfo.starttimestamp,
+    token:          imgInfo.edittoken
 
     minor:          true,
     bot:            true,
     assert:         'bot',
     nocreate:       true,
 
-    basetimestamp:  imgInfo.revisions[0].timestamp,
-    starttimestamp: imgInfo.starttimestamp,
-    token:          imgInfo.edittoken
+    summary:        config.texts[type + ' summary'],
+    prependtext:    config.texts[type + ' prepend'],
+    appendtext:     config.texts[type + ' append'],
   };
 
   if(!options.summary)
     return callback(null);
+
   if(!options.prependtext)
     delete options.prependtext;
+  else
+    options.prependtext += '\n\n';
+
   if(!options.appendtext)
     delete options.appendtext;
+  else
+    options.appendtext = '\n\n' + options.appendtext;
+
+  console.log(options);
+  return callback(null);
 
   api.exec('edit', options, useResult);
 
   function useResult(err, res) {
     if(err)
-      callback(err);
+      return callback(err);
     console.log(res.data);
     callback(null);
   }
@@ -335,8 +394,20 @@ Seq()
     readConfig(config, CONFIG_PAGE, this);
   })
   .seq(function() {
-    console.log('Processing images');
-    proceed(this);
+    var callback = this;
+    (function askAgain() {
+      rl.question('[r]ecent changes/[a]ll images/[Q]uit: ', function(c) {
+        if(!c || c[0] === 'q') {
+          callback(null)
+        } else if(c[0] === 'r') {
+          traverseRC(null, callback); // TODO: grcstart
+        } else if(c[0] === 'a') {
+          traverseAllImages(callback);
+        } else {
+          askAgain();
+        }
+      });
+    })();
   })
   .seq(function() {
     console.log('shutting down');
