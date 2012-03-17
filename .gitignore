@@ -1,0 +1,12 @@
+.*
+!.gitignore
+*~
+*.~*
+*.tmp
+*.log
+*.bak
+*.old
+*.swp
+*.nfs
+
+/node_modules
