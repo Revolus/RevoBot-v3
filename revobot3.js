@@ -15,6 +15,10 @@ var API = {
   path: '/w/api.php'
 };
 
+var PICTURES_IN_PARALLEL = 10;
+var TLLIMIT = 'max';
+var AILIMIT = 'max';
+
 var credentials = {
   name: null,
   pass: null
@@ -210,7 +214,7 @@ function proceed(callback) {
   function queryImages(aifrom) {
     var options = {
       list:    'allimages',
-      ailimit: 500,
+      ailimit: AILIMIT,
       aiprop:  'timestamp|size|sha1'
     };
     if(aifrom !== null)
@@ -222,7 +226,7 @@ function proceed(callback) {
     if(err)
       callback(err);
     Seq(res.data.query.allimages)
-      .parEach(20, function(image) {
+      .parEach(PICTURES_IN_PARALLEL, function(image) {
         processImage(image, this);
       })
       .seq(function() {
@@ -245,11 +249,11 @@ function processImage(image, callback) {
     var options = {
       prop:         'templates|revisions|info',
       tlnamespace:  10,
-      tllimit:      50,
+      tllimit:      TLLIMIT,
       rvprop:       'timestamp',
       rvlimit:      1,
-        inprop:    'protection',
-        intoken:   'edit',
+      inprop:      'protection',
+      intoken:     'edit',
       indexpageids: true,
       titles:       image.title
     };
@@ -263,7 +267,6 @@ function processImage(image, callback) {
       callback(err);
 
     var imgInfo = res.data.query.pages[ res.data.query.pageids[0] ];
-    console.log(imgInfo.title);
     var template;
     while( (template = imgInfo.templates.shift()) ) {
       if(config.ruleset.allow[template.title.substring(namespaces[10].length + 1)] === true)
@@ -304,7 +307,7 @@ function editImage(imgInfo, type, callback) {
   if(!options.appendtext)
     delete options.appendtext;
 
-  api.exec('edit', options);
+  api.exec('edit', options, useResult);
 
   function useResult(err, res) {
     if(err)
