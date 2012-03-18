@@ -5,10 +5,9 @@ var http = require('http');
 var rl = require('readline').createInterface(process.stdin, process.stdout, null);
 
 // npm
-var xml2js = new (require('xml2js').Parser);
 var Seq = require('seq');
 
-var CONFIG_PAGE = 'User:Forrester/lizenzvorlagen.js';
+var CONFIG_PAGE = 'Benutzer:RevoBot/config.js';
 var API = {
   host: 'de.wikipedia.org',
   port: 80,
@@ -16,9 +15,8 @@ var API = {
 };
 
 var PICTURES_IN_PARALLEL = 10;
-var TLLIMIT = 'max';
-var AILIMIT = 'max';
-var GRCLIMIT = 'max';
+var GAPLIMIT = '500';
+var GRCLIMIT = '500';
 
 var credentials = {
   name: null,
@@ -26,11 +24,10 @@ var credentials = {
 };
 var cookie = {};
 var config = {
-  pageid:  null,
-  oldid:   null,
-  title:   null,
-  texts:   {},
-  ruleset: {}
+  pageid: null,
+  oldid:  null,
+  title:  null,
+  data:   null
 };
 var namespaces = {};
 
@@ -84,7 +81,11 @@ function Api(api, cookie) {
         if(finished)
           return;
         finished = true;
-        callback(null, { res: res, data: JSON.parse(allData) });
+        var data = JSON.parse(allData);
+        if('error' in data)
+          throw data;
+        else
+          callback(null, { res: res, data: data });
       }
 
       function onClose(err) {
@@ -110,9 +111,9 @@ var api = new Api(API, cookie);
 
 function askCredentials(credentials, callback) {
   rl.question('Username: ', function(name) {
-    credentials.name = name;
+    credentials.name = name.trim();
     rl.question('Password [DISPLAYED!!!]: ', function(pass) {
-      credentials.pass = pass;
+      credentials.pass = pass.trim();
       callback(null, credentials);
     });
   });
@@ -165,40 +166,12 @@ function readConfig(config, page, callback) {
       return callback(err);
 
     config.pageid = +res.data.query.pageids[0];
-    config.title = res.data.query.pages[config.pageid].title;
-    var rev = res.data.query.pages[config.pageid].revisions[0];
-    config.oldid = rev.revid;
-    xml2js.parseString(rev['*'], function(err, data) {
-      if(err)
-        return callback(err);
+    config.title  = res.data.query.pages[config.pageid].title;
+    var rev       = res.data.query.pages[config.pageid].revisions[0];
+    config.oldid  = rev.revid;
+    config.data   = JSON.parse(rev['*']);
 
-      var el = data.settings.text;
-      for(var i = 0; i < el.length; ++i)
-        config.texts[ el[i]['@'].type ] = el[i]['#'];
-
-      var el = data.ruleset;
-      for(var i = 0; i < el.length; ++i)
-        for(var e in el[i])
-          if(e !== '@') {
-            var datum;
-            if('map' in el[i][e])
-              datum = el[i][e].map(function(x) {
-                return x['@'];
-              });
-            else
-              datum = [ el[i][e]['@'] ];
-            var items = {};
-            datum.map(function(x) {
-              for(var e in x)
-                return x[e];
-            }).forEach(function(x) {
-              items[x] = true;
-            });
-            config.ruleset[ el[i]['@'].type ] = items;
-          }
-
-      callback(null, config);
-    });
+    callback(null, config);
   }
 
   api.exec('query', {
@@ -211,143 +184,124 @@ function readConfig(config, page, callback) {
   }, onRes);
 }
 
-function traverseAllImages(callback) {
-  function queryAllImages(aifrom) {
-    var options = {
-      list:    'allimages',
-      ailimit: AILIMIT,
-      aiprop:  ''
-    };
-    if(aifrom !== null)
-      options.aifrom = aifrom;
-    api.exec('query', options, processImages);
+function traverseGenerator(generator, cont, options, callback) {
+  options.generator   = generator;
+  options.prop        = 'imageinfo|info|templates';
+  options.inprop      = 'protection'
+  options.intoken     = 'edit',
+  options.iilimit     = 1;
+  options.iiprop      = 'size|sha1|mime';
+  options.tlnamespace = 10;
+  options.tllimit     = 'max';
+
+  function query(c) {
+    if(c) {
+      options[cont] = c;
+      console.log("... " + c);
+    } else {
+      console.log("Starting ...");
+    }
+    api.exec('query', options, process);
   }
 
-  function processImages(err, res) {
+  function process(err, res) {
     if(err)
       return callback(err);
-    Seq(res.data.query.allimages)
-      .parEach(PICTURES_IN_PARALLEL, function(image) {
-        processImage(image.title, this);
+    var imageInfos = [];
+    for(var e in res.data.query.pages)
+      imageInfos.push(res.data.query.pages[e]);
+    Seq(imageInfos)
+      .parEach(PICTURES_IN_PARALLEL, function(imageInfo) {
+        processImage(imageInfo, this);
       })
       .seq(function() {
-        try {
-          if(res.data['query-continue'].allimages.aifrom)
-            return queryAllImages(res.data['query-continue'].allimages.aifrom);
-        } catch(e) { }
-        callback(null);
+        if('query-continue' in res.data)
+          query(res.data['query-continue'][generator][cont]);
+        else
+          callback(null);
       });
   }
 
-  queryAllImages(null);
+  query(null);
+}
+
+function traverseAllImages(callback) {
+  traverseGenerator('allpages', 'gapfrom', {
+    gapdir:       'ascending',
+    gapnamespace: 6,
+    gaplimit:     GAPLIMIT
+  }, callback);
 }
 
 function traverseRC(grcstart, callback) {
-  function queryRC(grcstart) {
-    var options = {
-      generator:      'recentchanges',
-      redirects:      true,
-      indexpageids:   true,
-      grcdir:         'newer',
-      grcnamespace:   6,
-      grcexcludeuser: credentials.name,
-      grcshow:        '!redirect',
-      grclimit:       GRCLIMIT,
-      grctype:        'edit|new',
-      grctoponly:     true
-    };
-    if(grcstart)
-      options.grcstart = grcstart;
-    api.exec('query', options, processRC);
-  }
-
-  function processRC(err, res) {
-    if(err)
-      return callback(err);
-    Seq(res.data.query.pageids)
-      .parEach(PICTURES_IN_PARALLEL, function(pageid) {
-        processImage(res.data.query.pages[pageid].title, this);
-      })
-      .seq(function() {
-        try {
-          if(res.data['query-continue'].recentchanges.grcstart) {
-            return queryRC(res.data['query-continue'].recentchanges.grcstart);
-          }
-        } catch(e) { }
-        callback(null);
-      });
-  }
-
-  queryRC(grcstart);
+  traverseGenerator('recentchanges', 'grcstart', {
+    grcdir:         'newer',
+    grcnamespace:   6,
+    grclimit:       GRCLIMIT,
+    grcexcludeuser: credentials.name,
+    grctype:        'edit|new',
+    grctoponly:     true
+  }, callback);
 }
 
-function stripNS(name, ns) {
-  if(!namespaces[ns])
-    return name;
+function stripNS(info, ns) {
+  if(!namespaces[info.ns])
+    return info.title;
   else
-    return name.substring(namespaces[ns].length + 1);
+    return info.title.substring(namespaces[info.ns].length + 1);
 }
 
-function processImage(title, callback) {
-  if(config.ruleset.ignore[stripNS(title, 6)] === true)
-    return callback(null);
-
-  function queryTemplates(tlcontinue) {
-    var options = {
-      prop:         'templates|revisions|info',
-      tlnamespace:  10,
-      tllimit:      TLLIMIT,
-      rvprop:       'timestamp',
-      rvlimit:      1,
-      inprop:      'protection',
-      intoken:     'edit',
-      indexpageids: true,
-      titles:       title
-    };
-    if(tlcontinue !== null)
-      options.tlcontinue = tlcontinue;
-    api.exec('query', options, processTemplates);
-  }
-
-  function processTemplates(err, res) {
-    if(err)
-      return callback(err);
-
-    var imgInfo = res.data.query.pages[ res.data.query.pageids[0] ];
-    var template;
-    if(imgInfo.templates) {
-      while( (template = imgInfo.templates.shift()) ) {
-        if(config.ruleset.allow[stripNS(template.title, 10)] === true)
-          return callback(null);
-      }
-    }
-
-    try {
-      if(res.data['query-continue'].templates.tlcontinue)
-        return queryTemplates(res.data['query-continue'].templates.tlcontinue);
-    } catch(e) { }
-
-    editImage(imgInfo, 'false', callback);
-  }
-
-  queryTemplates(null);
+function hasTemplateFor(type, imageInfo, yes, no) {
+  if(imageInfo.templates)
+    for(var i = 0; i < imageInfo.templates.length; ++i)
+      if(config.data[type]['*'].indexOf(stripNS(imageInfo.templates[i])) >= 0)
+        return yes();
+  no();
 }
 
-function editImage(imgInfo, type, callback) {
+function processImage(imageInfo, callback) {
+  if('missing' in imageInfo
+     || 'redirect' in imageInfo
+     || config.data['ignored file'].indexOf(stripNS(imageInfo.title)) >= 0) {
+    callback(null);
+    return;
+  }
+
+  var type;
+  if(imageInfo.imagerepository === 'local') {
+    type = 'local';
+  } else if(imageInfo.imagerepository === 'shared') {
+    type = 'commonsseite';
+  } else {
+    type = 'missing';
+  }
+
+  hasTemplateFor(type, imageInfo, function() {
+    findCommonsDuplicate(imageInfo, callback);
+  }, function() {
+    editImage(imageInfo, type, callback);
+  });
+}
+
+function findCommonsDuplicate(imageInfo, callback) {
+  // TODO
+  callback(null);
+}
+
+function editImage(imageInfo, type, callback) {
   var options = {
-    title:          imgInfo.title,
-    basetimestamp:  imgInfo.revisions[0].timestamp,
-    starttimestamp: imgInfo.starttimestamp,
-    token:          imgInfo.edittoken
+    title:          imageInfo.title,
+    starttimestamp: imageInfo.starttimestamp,
+    token:          imageInfo.edittoken,
 
     minor:          true,
     bot:            true,
     assert:         'bot',
     nocreate:       true,
 
-    summary:        config.texts[type + ' summary'],
-    prependtext:    config.texts[type + ' prepend'],
-    appendtext:     config.texts[type + ' append'],
+    summary:        config.data[type].summary,
+    prependtext:    config.data[type].prepend,
+    appendtext:     config.data[type].append
   };
 
   if(!options.summary)
@@ -372,19 +326,12 @@ function editImage(imgInfo, type, callback) {
     if(err)
       return callback(err);
     console.log(res.data);
+    // TODO: log
     callback(null);
   }
 }
 
 Seq()
-  .seq(function() {
-    console.log('Reading credentials');
-    askCredentials(credentials, this);
-  })
-  .seq(function() {
-    console.log('Logging in');
-    login(cookie, credentials.name, credentials.pass, this);
-  })
   .seq(function() {
     console.log('Reading local namespace aliases');
     readMetaNamespaces(namespaces, this);
@@ -392,6 +339,14 @@ Seq()
   .seq(function() {
     console.log('Reading config');
     readConfig(config, CONFIG_PAGE, this);
+  })
+  .seq(function() {
+    console.log('Reading credentials');
+    askCredentials(credentials, this);
+  })
+  .seq(function() {
+    console.log('Logging in');
+    login(cookie, credentials.name, credentials.pass, this);
   })
   .seq(function() {
     var callback = this;
