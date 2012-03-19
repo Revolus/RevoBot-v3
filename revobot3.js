@@ -2,14 +2,20 @@
 
 // builtin
 var http = require('http');
+var util = require('util');
 var rl = require('readline').createInterface(process.stdin, process.stdout, null);
 
 // npm
 var Seq = require('seq');
 
 var CONFIG_PAGE = 'Benutzer:RevoBot/config.js';
-var API = {
+var LOCAL_API = {
   host: 'de.wikipedia.org',
+  port: 80,
+  path: '/w/api.php'
+};
+var SHARED_API = {
+  host: 'commons.wikimedia.org',
   port: 80,
   path: '/w/api.php'
 };
@@ -29,7 +35,6 @@ var config = {
   title:  null,
   data:   null
 };
-var namespaces = {};
 
 function Api(api, cookie) {
   function exec(action, attrs, callback) {
@@ -83,7 +88,7 @@ function Api(api, cookie) {
         finished = true;
         var data = JSON.parse(allData);
         if('error' in data)
-          throw data;
+          throw new Error(util.inspect(data));
         else
           callback(null, { res: res, data: data });
       }
@@ -104,10 +109,21 @@ function Api(api, cookie) {
     req.on('error', onError);
     req.end(post);
   }
+
+  function stripNS(info) {
+    if(!this.namespaces[info.ns])
+      return info.title;
+    else
+      return info.title.substring(this.namespaces[info.ns].length + 1);
+  }
+
+  this.namespaces = {};
   this.exec = exec;
+  this.stripNS = stripNS;
 }
 
-var api = new Api(API, cookie);
+var local = new Api(LOCAL_API, cookie);
+var shared = new Api(SHARED_API, cookie);
 
 function askCredentials(credentials, callback) {
   rl.question('Username: ', function(name) {
@@ -125,7 +141,7 @@ function login(cookie, name, pass, callback) {
       return callback(err);
     if(res.data.login.result === 'NeedToken') {
       cookie[res.data.login.cookieprefix + '_session'] = res.data.login.sessionid;
-      api.exec('login', {
+      local.exec('login', {
         lgname: name,
         lgpassword: pass,
         lgtoken: res.data.login.token
@@ -141,13 +157,13 @@ function login(cookie, name, pass, callback) {
     }
   }
 
-  api.exec('login', {
+  local.exec('login', {
     lgname: name,
     lgpassword: pass
   }, onRes);
 }
 
-function readMetaNamespaces(namespaces, callback) {
+function readMetaNamespaces(api, callback) {
   api.exec('query', {
     meta: 'siteinfo',
     siprop: 'namespaces'
@@ -155,8 +171,8 @@ function readMetaNamespaces(namespaces, callback) {
     if(err)
       return callback(err);
     for(var e in res.data.query.namespaces)
-      namespaces[e] = res.data.query.namespaces[e]['*'] || null;
-    callback(null, namespaces);
+      api.namespaces[e] = res.data.query.namespaces[e]['*'] || null;
+    callback(null, api);
   });
 }
 
@@ -174,7 +190,7 @@ function readConfig(config, page, callback) {
     callback(null, config);
   }
 
-  api.exec('query', {
+  local.exec('query', {
     prop:         'revisions',
     rvprop:       'ids|content',
     rvlimit:      1,
@@ -186,11 +202,11 @@ function readConfig(config, page, callback) {
 
 function traverseGenerator(generator, cont, options, callback) {
   options.generator   = generator;
-  options.prop        = 'imageinfo|info|templates';
+  options.prop        = 'info|imageinfo|templates';
   options.inprop      = 'protection'
   options.intoken     = 'edit',
   options.iilimit     = 1;
-  options.iiprop      = 'size|sha1|mime';
+  options.iiprop      = 'size|sha1';
   options.tlnamespace = 10;
   options.tllimit     = 'max';
 
@@ -201,7 +217,7 @@ function traverseGenerator(generator, cont, options, callback) {
     } else {
       console.log("Starting ...");
     }
-    api.exec('query', options, process);
+    local.exec('query', options, process);
   }
 
   function process(err, res) {
@@ -244,17 +260,10 @@ function traverseRC(grcstart, callback) {
   }, callback);
 }
 
-function stripNS(info, ns) {
-  if(!namespaces[info.ns])
-    return info.title;
-  else
-    return info.title.substring(namespaces[info.ns].length + 1);
-}
-
 function hasTemplateFor(type, imageInfo, yes, no) {
   if(imageInfo.templates)
     for(var i = 0; i < imageInfo.templates.length; ++i)
-      if(config.data[type]['*'].indexOf(stripNS(imageInfo.templates[i])) >= 0)
+      if(config.data[type]['*'].indexOf(local.stripNS(imageInfo.templates[i])) >= 0)
         return yes();
   no();
 }
@@ -262,7 +271,7 @@ function hasTemplateFor(type, imageInfo, yes, no) {
 function processImage(imageInfo, callback) {
   if('missing' in imageInfo
      || 'redirect' in imageInfo
-     || config.data['ignored file'].indexOf(stripNS(imageInfo.title)) >= 0) {
+     || config.data['ignored file'].indexOf(local.stripNS(imageInfo)) >= 0) {
     callback(null);
     return;
   }
@@ -284,11 +293,64 @@ function processImage(imageInfo, callback) {
 }
 
 function findCommonsDuplicate(imageInfo, callback) {
-  // TODO
-  callback(null);
+  shared.exec('query', {
+    prop:         'categories',
+    cllimit:      'max',
+    indexpageids: true,
+    generator:    'allimages',
+    gailimit:     'max',
+    gaiminsize:   imageInfo.imageinfo[0].size,
+    gaimaxsize:   imageInfo.imageinfo[0].size,
+    gaisha1:      imageInfo.imageinfo[0].sha1
+  }, function(err, res) {
+    function hasIgnoredCat() {
+      for(var i = 0; i < page.categories.length; ++i)
+        if(config.data['commons ignore category'].indexOf(shared.stripNS(page.categories[i])) >= 0)
+          return true;
+      return false;
+    }
+
+    if(err)
+      return callback(err);
+
+    var noShadow = false;
+    if(!!res.data.query && !!res.data.query.pageids && !!res.data.query.pageids.length) {
+      for(var i = 0; i < res.data.query.pageids.length; ++i) {
+        var page = res.data.query.pages[ res.data.query.pageids[i] ];
+
+        if(hasIgnoredCat())
+          continue;
+
+        if(shared.stripNS(page) === local.stripNS(imageInfo)) {
+          var type = 'duplicate';
+          noShadow = true;
+        } else {
+          var type = 'renamed duplicate';
+        }
+
+        return hasTemplateFor(type, imageInfo, function() {
+          findShadow(imageInfo, callback);
+        }, function() {
+          editImage(imageInfo, type, callback, {
+            '%commons name%': shared.stripNS(page)
+          });
+        });
+      }
+    }
+
+    if(!noShadow)
+      findShadow(imageInfo, callback);
+    else
+      callback(null);
+  });
 }
 
-function editImage(imageInfo, type, callback) {
+function findShadow(imageInfo, callback) {
+  // TODO
+  return callback(null);
+}
+
+function editImage(imageInfo, type, callback, replacements) {
   var options = {
     title:          imageInfo.title,
     starttimestamp: imageInfo.starttimestamp,
@@ -304,23 +366,32 @@ function editImage(imageInfo, type, callback) {
     appendtext:     config.data[type].append
   };
 
+  function applyReplacements(text) {
+    if(!!replacements)
+      for(var e in replacements)
+        text = text.replace(e, replacements[e]);
+    return text;
+  }
+
   if(!options.summary)
     return callback(null);
+  else
+    options.summary = applyReplacements(options.summary);
 
   if(!options.prependtext)
     delete options.prependtext;
   else
-    options.prependtext += '\n\n';
+    options.prependtext = applyReplacements(options.prependtext) + '\n\n';
 
   if(!options.appendtext)
     delete options.appendtext;
   else
-    options.appendtext = '\n\n' + options.appendtext;
+    options.appendtext = '\n\n' + applyReplacements(options.appendtext);
 
   console.log(options);
   return callback(null);
 
-  api.exec('edit', options, useResult);
+  local.exec('edit', options, useResult);
 
   function useResult(err, res) {
     if(err)
@@ -332,11 +403,15 @@ function editImage(imageInfo, type, callback) {
 }
 
 Seq()
-  .seq(function() {
-    console.log('Reading local namespace aliases');
-    readMetaNamespaces(namespaces, this);
+  .par(function() {
+    console.log('Reading local namespaces');
+    readMetaNamespaces(local, this);
   })
-  .seq(function() {
+  .par(function() {
+    console.log('Reading shared namespaces');
+    readMetaNamespaces(shared, this);
+  })
+  .par(function() {
     console.log('Reading config');
     readConfig(config, CONFIG_PAGE, this);
   })
@@ -350,7 +425,7 @@ Seq()
   })
   .seq(function() {
     var callback = this;
-    (function askAgain() {
+    function askAgain() {
       rl.question('[r]ecent changes/[a]ll images/[Q]uit: ', function(c) {
         if(!c || c[0] === 'q') {
           callback(null)
@@ -362,7 +437,8 @@ Seq()
           askAgain();
         }
       });
-    })();
+    }
+    askAgain();
   })
   .seq(function() {
     console.log('shutting down');
