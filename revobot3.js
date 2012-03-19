@@ -310,6 +310,13 @@ function findCommonsDuplicate(imageInfo, callback) {
       return false;
     }
 
+    function goOn() {
+      if(!noShadow)
+        findShadow(imageInfo, callback);
+      else
+        callback(null);
+    }
+
     if(err)
       return callback(err);
 
@@ -328,9 +335,7 @@ function findCommonsDuplicate(imageInfo, callback) {
           var type = 'renamed duplicate';
         }
 
-        return hasTemplateFor(type, imageInfo, function() {
-          findShadow(imageInfo, callback);
-        }, function() {
+        return hasTemplateFor(type, imageInfo, goOn, function() {
           editImage(imageInfo, type, callback, {
             '%commons name%': shared.stripNS(page)
           });
@@ -338,16 +343,25 @@ function findCommonsDuplicate(imageInfo, callback) {
       }
     }
 
-    if(!noShadow)
-      findShadow(imageInfo, callback);
-    else
-      callback(null);
+    goOn();
   });
 }
 
 function findShadow(imageInfo, callback) {
-  // TODO
-  return callback(null);
+  // TODO: could be parallelized for multiple images
+  shared.exec('query', {
+    titles:       shared.namespaces[6] + ':' + local.stripNS(imageInfo),
+    prop:         'imageinfo',
+    indexpageids: true
+  }, function(err, res) {
+    if(err)
+      callback(err);
+    var page = res.data.query.pages[ res.data.query.pageids[0] ];
+    if('missing' in page || page.imagerepository !== 'local')
+      callback(null);
+    else
+      editImage(imageInfo, 'shadows commons', callback);
+  });
 }
 
 function editImage(imageInfo, type, callback, replacements) {
