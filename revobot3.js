@@ -304,9 +304,10 @@ function findCommonsDuplicate(imageInfo, callback) {
     gaisha1:      imageInfo.imageinfo[0].sha1
   }, function(err, res) {
     function hasIgnoredCat() {
-      for(var i = 0; i < page.categories.length; ++i)
-        if(config.data['commons ignore category'].indexOf(shared.stripNS(page.categories[i])) >= 0)
-          return true;
+      if(!!page.categories)
+        for(var i = 0; i < page.categories.length; ++i)
+          if(config.data['commons ignore category'].indexOf(shared.stripNS(page.categories[i])) >= 0)
+            return true;
       return false;
     }
 
